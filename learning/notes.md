@@ -17,6 +17,11 @@
 | `cp -r app backup/app_copy` | Copies a whole folder, including its contents |
 | `rm backup/index.html.bak` | Deletes a file |
 | `ln -s ~/devops/app app_link` | Creates a symlink (shortcut) pointing to the `app` folder |
+| `cd ..` | Moves up one level to the parent directory |
+| `cd -` | Returns to the previous directory and prints it |
+| `cd` (no argument) | Goes to the home directory (~) from anywhere |
+| `~` and `/` | `~` is home (/root for root); `/` is the top of the filesystem tree |
+| `ln -s target linkname` | Creates a symlink; used to enable Nginx sites and switch release versions |
 
 ## Quiz answers
 
