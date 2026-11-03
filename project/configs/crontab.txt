@@ -1,0 +1,3 @@
+*/5 * * * * /opt/shoplite/project/scripts/health_check.sh
+0 1 * * * /opt/shoplite/project/scripts/backup.sh >> /var/log/shoplite/backup.log 2>&1
+0 8 * * * /opt/shoplite/project/scripts/log_report.sh >> /var/log/shoplite/report.log 2>&1
