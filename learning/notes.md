@@ -363,7 +363,7 @@ A bash script is a text file of commands run in order, with variables, condition
 
 ### health.sh
 
-
+```bash
 #!/bin/bash
 # health.sh: prints hostname, uptime, disk and memory usage
 
@@ -390,8 +390,8 @@ for svc in nginx ssh; do
     else
         echo "$svc is DOWN"
     fi
-
-
+done
+```
 ### cron
 
 Cron is the Linux scheduler: a background service that runs commands at set times. Jobs are stored in a crontab.
