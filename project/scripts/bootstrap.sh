@@ -40,21 +40,19 @@ chown "$ADMIN:$ADMIN" /home/$ADMIN/.ssh/authorized_keys
 chmod 600 /home/$ADMIN/.ssh/authorized_keys
 
 # 4. SSH hardening (only after the key is in place)
-log "hardening sshd"
-mkdir -p /run/sshd /etc/ssh/sshd_config.d
-sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
-sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-# Ubuntu cloud images set PasswordAuthentication in drop-in files that override the main file
-for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
-    [ -f "$f" ] && sed -i 's/^[[:space:]]*#\?[[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/I' "$f"
-done
-printf 'PermitRootLogin no\nPasswordAuthentication no\n' > /etc/ssh/sshd_config.d/00-hardening.conf
-if sshd -t; then
-    systemctl restart ssh 2>/dev/null || service ssh restart
-else
-    log "sshd config test FAILED, not restarting"
-fi
-
+   # 4. SSH hardening (only after the key is in place)
+   log "hardening sshd"
+   mkdir -p /run/sshd /etc/ssh/sshd_config.d
+   for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+       [ -f "$f" ] && sed -i 's/^[[:space:]]*#\?[[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/I' "$f"
+       [ -f "$f" ] && sed -i 's/^[[:space:]]*#\?[[:space:]]*PermitRootLogin.*/PermitRootLogin no/I' "$f"
+   done
+   printf 'PermitRootLogin no\nPasswordAuthentication no\n' > /etc/ssh/sshd_config.d/00-hardening.conf
+   if sshd -t; then
+       systemctl restart ssh 2>/dev/null || service ssh restart
+   else
+       log "sshd config test FAILED, not restarting"
+   fi
 # 5. Firewall
 log "configuring ufw"
 ufw default deny incoming
