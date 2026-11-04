@@ -413,3 +413,49 @@ Format: `minute hour day-of-month month day-of-week command`.
 | `0 1 * * *` | Daily at 01:00 |
 | `0 8 * * *` | Daily at 08:00 |
 | `30 2 * * 1` | Every Monday at 02:30 |
+
+## Quiz answers
+
+**1. What is the difference between `/etc`, `/var` and `/opt`?**
+
+`/etc` holds configuration files. `/var` holds data that changes at runtime, such as logs, caches and backups. `/opt` holds optional third-party software (I cloned the project to `/opt/shoplite`).
+
+**2. A file shows `-rw-r-----`. Who can read it, and what is its numeric mode?**
+
+The owner can read and write, and the group can read. Others have no access. The mode is 640.
+
+**3. How do you find which process is using port 80?**
+
+`ss -tulpn | grep :80` (or `lsof -i :80`).
+
+**4. What is the difference between `systemctl restart` and `systemctl reload`?**
+
+`restart` stops and starts the service, so connections drop briefly. `reload` re-reads the config without stopping, so there is no downtime.
+
+**5. How would you find all files over 100 MB on the server?**
+
+`find / -size +100M 2>/dev/null`
+
+**6. What does `2>&1` do in `command > out.log 2>&1`?**
+
+It sends errors (stream 2) to the same place as normal output (stream 1), so both end up in `out.log`.
+
+**7. Write the cron expression for "every Monday at 02:30".**
+
+`30 2 * * 1`
+
+**8. A disk is 95% full. List the commands you would run, in order, to find the cause.**
+
+1. `df -h` to find the full filesystem.
+2. `du -sh /* 2>/dev/null | sort -h | tail -5` to find the biggest folders.
+3. Repeat `du` inside the biggest folder to drill down.
+4. `find / -size +100M 2>/dev/null` to find large files.
+5. `ls -lh /var/log` to check logs, then delete, rotate or move what is not needed.
+
+**9. Why should SSH password login be disabled on a production server?**
+
+Passwords can be brute-forced, leaked or reused. Keys cannot be guessed, so with `PasswordAuthentication no` only holders of an authorized private key can log in.
+
+**10. What is the difference between a process being killed with `kill` and `kill -9`?**
+
+`kill` sends SIGTERM (15), a polite request that lets the process clean up. `kill -9` sends SIGKILL, which stops it immediately with no cleanup. Use it as a last resort.
