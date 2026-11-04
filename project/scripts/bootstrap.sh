@@ -6,7 +6,7 @@ set -u
 REPO_URL=${REPO_URL:-https://github.com/laxmikumb/devops-linux.git}
 APP_DIR=/opt/shoplite
 ADMIN=deploy
-PUBKEY_FILE=${PUBKEY_FILE:-}     # optional: public key file for the deploy user
+PUBKEY_FILE=${PUBKEY_FILE:-}
 
 log() { echo "[bootstrap] $1"; }
 
@@ -39,20 +39,22 @@ fi
 chown "$ADMIN:$ADMIN" /home/$ADMIN/.ssh/authorized_keys
 chmod 600 /home/$ADMIN/.ssh/authorized_keys
 
-# 4. SSH hardening (only after the key is in place)
+# 4. SSH hardening (sshd uses the FIRST value it finds, so remove old lines and put ours on top)
 log "hardening sshd"
 mkdir -p /run/sshd /etc/ssh/sshd_config.d
 for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
-    [ -f "$f" ] && sed -i 's/^[[:space:]]*#\?[[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/I' "$f"
+    [ -f "$f" ] && sed -i '/^[[:space:]]*#\?[[:space:]]*PasswordAuthentication/Id; /^[[:space:]]*#\?[[:space:]]*PermitRootLogin/Id' "$f"
 done
 printf 'PermitRootLogin no\nPasswordAuthentication no\n' > /etc/ssh/sshd_config.d/00-hardening.conf
-grep -q '^PasswordAuthentication no' /etc/ssh/sshd_config || echo "PasswordAuthentication no" >> /etc/ssh/sshd_config
-grep -q '^PermitRootLogin no' /etc/ssh/sshd_config || echo "PermitRootLogin no" >> /etc/ssh/sshd_config
+printf 'PermitRootLogin no\nPasswordAuthentication no\n' | cat - /etc/ssh/sshd_config > /tmp/sshd_config.new
+cat /tmp/sshd_config.new > /etc/ssh/sshd_config
+rm -f /tmp/sshd_config.new
 if sshd -t; then
     systemctl restart ssh 2>/dev/null || service ssh restart
 else
     log "sshd config test FAILED, not restarting"
 fi
+sshd -T | grep -Ei "permitrootlogin|passwordauthentication"
 
 # 5. Firewall
 log "configuring ufw"
@@ -65,12 +67,7 @@ ufw --force enable
 
 # 6. fail2ban for SSH
 log "enabling fail2ban"
-cat > /etc/fail2ban/jail.local <<'EOF'
-[sshd]
-enabled = true
-maxretry = 5
-bantime = 600
-EOF
+printf '[sshd]\nenabled = true\nmaxretry = 5\nbantime = 600\n' > /etc/fail2ban/jail.local
 systemctl enable --now fail2ban 2>/dev/null || service fail2ban restart
 
 # 7. Automatic security updates
@@ -87,7 +84,7 @@ else
 fi
 chmod +x "$APP_DIR"/project/scripts/*.sh
 
-# 9. Deploy site (deploy.sh copies site, installs nginx config, tests, reloads)
+# 9. Deploy site
 log "deploying site"
 rm -f /etc/nginx/sites-enabled/default
 SKIP_PULL=1 "$APP_DIR/project/scripts/deploy.sh"
