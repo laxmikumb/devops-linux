@@ -1,6 +1,5 @@
 # Git Practice Notes
 
-DevOps Trainee, Git & Docker task. Laxmi Kumbar. Repo: devops-linux
 
 ## My practice log (short entries I wrote while practising)
 
