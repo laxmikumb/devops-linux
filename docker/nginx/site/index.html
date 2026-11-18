@@ -20,5 +20,18 @@
     <div class="card"><h3>Water Bottle</h3><p>Rs. 249</p></div>
   </div>
   <footer>Served by Nginx on shoplite-web01</footer>
+<h2>Products</h2>
+<ul id="products"></ul>
+<script>
+  fetch('/api/products')
+    .then(r => r.json())
+    .then(items => {
+      document.getElementById('products').innerHTML =
+        items.map(p => `<li>${p.name} - $${p.price.toFixed(2)}</li>`).join('');
+    })
+    .catch(() => {
+      document.getElementById('products').innerHTML = '<li>Products unavailable</li>';
+    });
+</script>
 </body>
 </html>
