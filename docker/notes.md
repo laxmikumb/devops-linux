@@ -525,6 +525,508 @@ docker history secret-demo --no-trunc | grep DB_PASSWORD     # readable by anyon
 
 ---
 
+# P: ShopLite project, full guide
+
+ShopLite is a small shop made of three containers.
+
+- **nginx** is the only public service. It serves the web page and forwards `/api/` requests to the app.
+- **app** is a Flask API (run by gunicorn) that reads products from the database.
+- **db** is PostgreSQL. It stores the products in a named volume.
+
+Two networks keep the layers apart. `frontend` holds nginx and app. `backend` holds app and db. The app sits on both, so it can talk to both sides, but nginx can never reach the database directly. Only nginx publishes a port (host `8088` to container `80`).
+
+```
+browser --> nginx (8088) --> app (5000) --> db (5432)
+            [frontend]       [frontend+backend]   [backend]
+```
+
+---
+
+## 1. Folder layout
+
+```bash
+cd ~/devops-linux
+mkdir -p docker/{nginx/site,app,db,scripts,screenshots}
+```
+
+`mkdir -p` creates the folders and does not complain if they already exist. The curly braces create all of them in one command.
+
+```
+docker/
+  compose.yaml        wires the three services together
+  .env.example        template for the secrets (committed)
+  .env                the real values (never committed)
+  nginx/              Dockerfile, nginx.conf, site/index.html
+  app/                Dockerfile, app.py, requirements.txt
+  db/init.sql         creates and fills the products table
+  scripts/            backup.sh, health_check.sh
+  screenshots/        proof for the README
+```
+
+---
+
+## 2. The files and what each part does
+
+### `.env.example` and `.env`
+
+```
+POSTGRES_USER=shop
+POSTGRES_PASSWORD=change_me
+POSTGRES_DB=shoplite
+```
+
+These are the database credentials. The `.env.example` file is a template with placeholder values, and it is committed to Git. The real `.env` is created from it and stays on your machine, because `.gitignore` lists `.env`. Passwords never go into an image or into Git.
+
+```bash
+cd ~/devops-linux/docker
+cp .env.example .env        # copy the template, then put a real password in .env
+```
+
+### `db/init.sql`
+
+```sql
+CREATE TABLE IF NOT EXISTS products (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  price NUMERIC(10,2) NOT NULL
+);
+INSERT INTO products (name, price) VALUES
+  ('Notebook', 4.50), ('Pen Set', 3.25), ('Backpack', 29.99),
+  ('Water Bottle', 8.75), ('Desk Lamp', 15.00);
+```
+
+- `CREATE TABLE IF NOT EXISTS` makes the table only if it is missing.
+- `SERIAL PRIMARY KEY` gives every row an automatic unique id.
+- `NUMERIC(10,2)` stores money exactly, with 2 decimal places.
+- The `INSERT` loads 5 starter products.
+
+Postgres runs this file **only on the first start, when the data volume is empty**. That is why it is safe to restart the stack without duplicating products.
+
+### `app/app.py`
+
+```python
+import os
+import psycopg2
+from flask import Flask, jsonify
+
+app = Flask(__name__)
+
+def get_conn():
+    return psycopg2.connect(
+        host=os.environ["DB_HOST"],
+        dbname=os.environ["POSTGRES_DB"],
+        user=os.environ["POSTGRES_USER"],
+        password=os.environ["POSTGRES_PASSWORD"],
+    )
+
+@app.route("/api/health")
+def health():
+    return "OK", 200
+
+@app.route("/api/products")
+def products():
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, name, price FROM products ORDER BY id")
+        rows = [{"id": r[0], "name": r[1], "price": float(r[2])} for r in cur.fetchall()]
+        return jsonify(rows)
+    finally:
+        conn.close()
+```
+
+- `get_conn()` reads every connection detail from environment variables, so no password is written in the code. `DB_HOST` is `db`, the service name, which Docker's DNS turns into the database container's IP.
+- `/api/health` returns `OK` and does not touch the database. The Compose healthcheck uses it to see if the app process is alive.
+- `/api/products` runs the query and returns the rows as JSON. The `finally` block always closes the connection, even if the query fails.
+
+### `app/requirements.txt`
+
+```
+flask==3.0.3
+psycopg2-binary==2.9.9
+gunicorn==22.0.0
+```
+
+Versions are pinned, so every build installs the same packages. `psycopg2-binary` is the Postgres driver, and `gunicorn` is a production web server (Flask's built-in server is only for development).
+
+### `app/Dockerfile`
+
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py .
+RUN useradd --system --no-create-home appuser
+USER appuser
+EXPOSE 5000
+CMD ["gunicorn", "-b", "0.0.0.0:5000", "app:app"]
+```
+
+| Line | Why |
+|---|---|
+| `FROM python:3.12-slim` | small Debian-based Python image |
+| `WORKDIR /app` | all later commands run in `/app` |
+| `COPY requirements.txt .` then `RUN pip install` | dependencies first, so this layer is cached and only rebuilt when `requirements.txt` changes |
+| `--no-cache-dir` | no pip download cache stored in the image, so it is smaller |
+| `COPY app.py .` | code last, because it changes most often |
+| `useradd` and `USER appuser` | the app runs as a normal user, not root |
+| `EXPOSE 5000` | documents the port (does not publish it) |
+| `CMD [...]` | starts gunicorn on all interfaces, serving the `app` object from `app.py` |
+
+### `nginx/nginx.conf`
+
+```nginx
+server {
+    listen 80;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    location /api/ {
+        resolver 127.0.0.11 valid=10s;
+        set $upstream http://app:5000;
+        proxy_pass $upstream;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+- `location /` serves the static page from the html folder.
+- `location /api/` forwards API calls to the app container.
+- `resolver 127.0.0.11` is Docker's built-in DNS. Putting the address in a variable (`$upstream`) makes nginx look up `app` at request time instead of once at startup. So nginx starts fine even if the app is down, and it finds the app again after the app restarts. When the app is down, the result is a `502 Bad Gateway` for `/api/` only, and the page itself still loads.
+- The two `proxy_set_header` lines pass the original host and client IP to the app.
+
+### `nginx/Dockerfile`
+
+```dockerfile
+FROM nginx:alpine
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY site/ /usr/share/nginx/html/
+EXPOSE 80
+```
+
+It starts from the small Alpine nginx image, replaces the default site config with ours, and copies the web page into nginx's html folder.
+
+### `nginx/site/index.html`
+
+The page shows the shop header and a Products section. A small script calls `fetch('/api/products')` and lists the result. If the call fails, it shows "Products unavailable", which is what you see when the app is stopped.
+
+### `compose.yaml`
+
+```yaml
+services:
+  db:
+    image: postgres:16-alpine
+    env_file: .env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  app:
+    build: ./app
+    image: laxmi707/shoplite-app:v1.0
+    env_file: .env
+    environment:
+      DB_HOST: db
+    networks: [frontend, backend]
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/api/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  nginx:
+    build: ./nginx
+    image: laxmi707/shoplite-nginx:v1.0
+    ports:
+      - "8088:80"
+    networks: [frontend]
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+networks:
+  frontend:
+  backend:
+
+volumes:
+  pgdata:
+```
+
+| Setting | What it does |
+|---|---|
+| `image:` (db) | official Postgres 16 on Alpine |
+| `env_file: .env` | loads the credentials from `.env` into the container |
+| `pgdata:/var/lib/postgresql/data` | named volume, so the data survives container removal |
+| `./db/init.sql:...:ro` | mounts the SQL file where Postgres looks for start-up scripts, read-only |
+| `networks:` | puts each service on only the networks it needs |
+| `healthcheck:` | Docker runs the `test` command repeatedly and marks the container healthy or unhealthy |
+| `$${POSTGRES_USER}` | the double `$` stops Compose from substituting the value on the host, so the container's own shell fills it in |
+| `build:` plus `image:` | builds from the folder and names the result, ready to push to Docker Hub |
+| `depends_on: condition: service_healthy` | starts a service only after the one it needs is healthy: db, then app, then nginx |
+| `ports: "8088:80"` | host port 8088 maps to nginx's port 80. This is the only published port |
+| `restart: unless-stopped` | brings a container back after a crash or reboot, unless you stopped it on purpose |
+| `volumes: pgdata:` | declares the named volume |
+
+---
+
+## 3. Scripts
+
+Make them executable once:
+
+```bash
+cd ~/devops-linux/docker
+chmod +x scripts/*.sh
+```
+
+### `scripts/backup.sh`
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+set -a; source .env; set +a
+
+BACKUP_DIR=./backups
+mkdir -p "$BACKUP_DIR"
+FILE="$BACKUP_DIR/shoplite_$(date +%Y%m%d_%H%M%S).sql"
+
+docker compose exec -T db pg_dump -U "$POSTGRES_USER" --clean --if-exists "$POSTGRES_DB" > "$FILE"
+
+# keep only the newest 7
+ls -1t "$BACKUP_DIR"/shoplite_*.sql | tail -n +8 | xargs -r rm --
+echo "$(date '+%F %T') backup saved: $FILE"
+```
+
+| Line | Meaning |
+|---|---|
+| `#!/usr/bin/env bash` | run the script with bash |
+| `set -euo pipefail` | stop on any error (`-e`), on an unset variable (`-u`), and when any command in a pipe fails (`pipefail`), so a half-failed backup isn't treated as a success |
+| `cd "$(dirname "$0")/.."` | move to the `docker/` folder, whatever folder you run it from, so `compose.yaml` and `.env` are found |
+| `set -a; source .env; set +a` | load the variables from `.env` into the script (`-a` exports them) |
+| `mkdir -p "$BACKUP_DIR"` | create `backups/` if missing |
+| `FILE=...$(date ...)` | builds a timestamped name, such as `shoplite_20261119_055312.sql` |
+| `docker compose exec -T db pg_dump ...` | runs `pg_dump` inside the db container. `-T` turns off the pseudo-terminal so the output can be redirected to a file |
+| `--clean --if-exists` | the dump starts with `DROP TABLE IF EXISTS`, so restoring replaces the table cleanly |
+| `> "$FILE"` | saves the dump on the host |
+| `ls -1t ... \| tail -n +8 \| xargs -r rm --` | list newest first, skip the first 7, delete the rest. `-r` means do nothing if the list is empty |
+| `echo ...` | prints when and where the backup was saved |
+
+### `scripts/health_check.sh`
+
+```bash
+#!/usr/bin/env bash
+cd "$(dirname "$0")/.."
+LOG=./health_check.log
+
+for svc in db app nginx; do
+  cid=$(docker compose ps -q "$svc")
+  if [ -z "$cid" ]; then
+    echo "$(date '+%F %T') $svc missing, starting" | tee -a "$LOG"
+    docker compose up -d "$svc"
+    continue
+  fi
+  status=$(docker inspect -f '{{.State.Health.Status}}' "$cid")
+  if [ "$status" != "healthy" ]; then
+    echo "$(date '+%F %T') $svc is $status, restarting" | tee -a "$LOG"
+    docker compose restart "$svc"
+  else
+    echo "$(date '+%F %T') $svc healthy" | tee -a "$LOG"
+  fi
+done
+```
+
+| Line | Meaning |
+|---|---|
+| `cd "$(dirname "$0")/.."` | same trick as before: work from the `docker/` folder |
+| `LOG=./health_check.log` | where results are recorded (ignored by Git) |
+| `for svc in db app nginx` | check each service in turn |
+| `docker compose ps -q "$svc"` | prints the container id, and nothing if it isn't running |
+| `[ -z "$cid" ]` | no container id means the service is stopped or missing, so start it with `up -d` |
+| `docker inspect -f '{{.State.Health.Status}}'` | reads the health status Docker already tracks: `healthy`, `unhealthy` or `starting` |
+| `!= "healthy"` | restart anything that isn't healthy |
+| `tee -a "$LOG"` | prints the message and appends it to the log file |
+
+Run it by hand, or from cron every 5 minutes:
+
+```bash
+./scripts/health_check.sh
+# optional, in crontab -e:
+# */5 * * * * /home/<you>/devops-linux/docker/scripts/health_check.sh
+```
+
+---
+
+## 4. Build and run
+
+```bash
+cd ~/devops-linux/docker
+docker info | grep 'Operating System'    # confirm you are on the engine you expect
+docker compose up -d --build
+docker compose ps
+```
+
+| Command | What it does |
+|---|---|
+| `docker compose up -d --build` | builds the app and nginx images, creates the networks and volume, and starts all three services in the background (`-d`). Start order follows `depends_on`: db, then app, then nginx |
+| `docker compose ps` | lists the services. Wait until all three say `(healthy)` (about 30 to 40 seconds) |
+
+Check that everything works:
+
+```bash
+curl -s localhost:8088/api/health        # OK
+curl -s localhost:8088/api/products      # JSON with 5 products
+```
+
+Then open `http://localhost:8088` in the browser. You should see the shop page and the 5 products listed. This also proves the whole chain: browser, nginx, app, db.
+
+Other useful commands:
+
+```bash
+docker compose logs --tail 20 app        # last 20 log lines of one service
+docker compose logs -f                   # follow all logs; Ctrl+C to stop
+docker compose images                    # images used by the stack
+```
+
+---
+
+## 5. Prove the network isolation
+
+```bash
+docker compose exec nginx ping -c 1 db
+docker compose exec app python -c "import socket; print(socket.gethostbyname('db'))"
+```
+
+- From **nginx**, `ping db` fails with `bad address 'db'`. nginx is only on `frontend`, so it can't even resolve the database's name.
+- From **app**, the name `db` resolves to an IP (for example `172.20.0.2`), because the app is on `backend`.
+
+This is the design goal: the public-facing container cannot reach the database, and only the app can.
+
+---
+
+## 6. Failure tests
+
+### Test 1: the app goes down
+
+```bash
+docker compose stop app
+curl -s -o /dev/null -w "site: %{http_code}\n" localhost:8088/
+curl -i localhost:8088/api/products
+```
+
+- The site returns `200`, because nginx serves the page itself.
+- `/api/products` returns `502 Bad Gateway`, because nginx can't reach the app.
+- In the browser, the page loads and shows "Products unavailable".
+
+Recover:
+
+```bash
+docker compose start app
+sleep 30
+docker compose ps                        # app (healthy) again
+curl -s localhost:8088/api/products      # 5 products again
+```
+
+### Test 2: down and up keeps the data
+
+```bash
+docker compose down
+docker compose up -d
+sleep 40
+docker compose ps
+curl -s localhost:8088/api/products
+```
+
+`down` removes the containers and networks but **keeps the `pgdata` volume**, so the same 5 products come back. Don't add `-v`: `down -v` deletes the volume and the data. Confirm the volume exists with `docker volume ls | grep pgdata`.
+
+### Test 3: delete data, then restore from a backup
+
+```bash
+./scripts/backup.sh
+LATEST=$(ls -t backups/*.sql | head -1)
+echo "$LATEST"
+
+docker compose exec db psql -U shop -d shoplite -c "DELETE FROM products WHERE id=1;"
+docker compose exec db psql -U shop -d shoplite -c "SELECT count(*) FROM products;"      # 4
+
+docker compose exec -T db psql -U shop -d shoplite < "$LATEST"
+docker compose exec db psql -U shop -d shoplite -c "SELECT count(*) FROM products;"      # 5
+curl -s localhost:8088/api/products                                                      # Notebook is back
+```
+
+- `LATEST=$(ls -t backups/*.sql | head -1)` picks the newest backup file.
+- `psql -c "..."` runs one SQL statement inside the db container.
+- The restore feeds the dump file into `psql` through standard input (`<`), so `-T` is needed again. Because the dump was made with `--clean --if-exists`, it drops the table and recreates it with the saved rows.
+
+### Test 4: the health script repairs the stack
+
+```bash
+docker compose stop app
+./scripts/health_check.sh                # prints "app missing, starting" and starts it
+docker compose ps
+cat health_check.log
+```
+
+---
+
+## 7. Publish the images and tag the release
+
+```bash
+docker login -u laxmi707                 # use a Docker Hub access token as the password
+docker push laxmi707/shoplite-nginx:v1.0
+docker push laxmi707/shoplite-app:v1.0
+docker manifest inspect laxmi707/shoplite-app:v1.0 > /dev/null && echo "app image on Hub"
+```
+
+- Create the token in Docker Hub: Account settings, Personal access tokens, with Read and Write rights. Never paste it into a file in the repo.
+- Compose already tagged the images with these names (`image:` in `compose.yaml`), so no `docker tag` is needed.
+- `docker manifest inspect` asks Docker Hub directly, which confirms the push worked.
+
+Commit and release through a branch and a pull request, merging on GitHub **before** pulling:
+
+```bash
+git switch -c feature/docs
+git add docker/README.md docker/screenshots
+git commit -m "Add README and screenshots"
+git push -u origin feature/docs
+# merge the pull request in the browser, wait for the Merged badge, then:
+git switch main && git pull
+git tag -a docker-v1.0 -m "ShopLite Docker stack v1.0"
+git push origin docker-v1.0
+```
+
+---
+
+## 8. Stop and clean up
+
+```bash
+docker compose down            # stops and removes containers and networks, keeps the data
+docker compose down -v         # also deletes the pgdata volume (data is lost)
+docker compose restart app     # restart a single service
+```
+
 # Command comparison sheet
 
 | Goal | Use this | Not this, and why |
